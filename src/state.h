@@ -18,7 +18,14 @@ typedef struct {
 		size_t count;
 	} stmts;
 } Func;
+typedef enum {
+	SCOPE_IGN,
+	SCOPE_MAIN,
+	SCOPE_FUNC,
+	SCOPE_
+} ScopeType;
 typedef struct {
+	ScopeType type;
 	struct VLB(Var) vars;
 } Scope;
 typedef struct {

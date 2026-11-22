@@ -1,5 +1,5 @@
-#include "errors.h"
-#include "filesystem.h"
+#include "error.h"
+#include "fs.h"
 #include "string.h"
 
 #include <stdio.h>
@@ -28,8 +28,8 @@ static int UseFirstFabFile_Cmp(const void* a, const void* b) {
 static int UseFirstFabFile(void) {
 	size_t count;
 	FileInfo* ls = Ls(".", "*.fab", true, &count);
-	if (!ls) {ERR_INT(); return 2;}
-	if (!count) {ERR_NOFAB(); return 1;}
+	if (!count) {PUTERR_LIT(NOFAB); return 1;}
+	if (count == (size_t)-1) {PUTERR_LIT(INT); return 2;}
 	qsort(ls, count, sizeof(*ls), UseFirstFabFile_Cmp);
 	filename = DupStr(ls[0].name);
 	FreeLs(ls);

@@ -9,6 +9,10 @@
     size_t len;\
     size_t size;\
 }
+#define IVLB(T) \
+    T* data;\
+    size_t len;\
+    size_t size
 
 #define VLB_OOM_NOP
 

@@ -6,13 +6,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-typedef unsigned ObjectType;
-enum {
+typedef enum {
 	OBJECTTYPE_NULL,
 	OBJECTTYPE_STRING,
 	OBJECTTYPE_ARRAY,
 	OBJECTTYPE_COW
-};
+} ObjectType;
 
 typedef struct Object Object;
 typedef union {
@@ -49,7 +48,10 @@ void DelObject(Object*);
 
 bool SetObject(Object* dest, Object* src);
 bool CatObject(Object* dest, Object* src);
+bool ArrCatObject(Object* dest, Object* src);
 bool CatStrToObject(Object*, const char* str, size_t len, ObjStrStorType);
+bool ArrCatStrToObject(Object*, const char* str, size_t len, ObjStrStorType);
 #define CatLitStrToObject(OBJ, STR) (CatStrToObject((OBJ), ("" STR), sizeof(STR) - 1, OBJSTRSTOR_STATIC))
+#define ArrCatLitStrToObject(OBJ, STR) (ArrCatStrToObject((OBJ), ("" STR), sizeof(STR) - 1, OBJSTRSTOR_STATIC))
 
 #endif

@@ -1,5 +1,5 @@
-#ifndef FAB_FILESYSTEM_H
-#define FAB_FILESYSTEM_H
+#ifndef FAB_FS_H
+#define FAB_FS_H
 
 #include "vlb.h"
 
