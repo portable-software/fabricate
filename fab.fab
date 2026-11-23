@@ -1,0 +1,91 @@
+version 0.0.0
+features regex
+phony-default build
+
+PLAT ?= ${platform}
+ARCH ?= ${platform %arch%}
+PLATPATH = $PLAT/$ARCH
+
+SRCDIR ?= src
+OBJDIR ?= obj
+OUTDIR ?= .
+
+if ${not-eq $DEBUG, y} {
+	OBJDIR += /release
+} else {
+	OBJDIR += /debug
+	if ${eq $ASAN, y} {OBJDIR += _asan}
+}
+OBJDIR += /$PLATPATH
+
+SOURCES = ${wc-ls $SRCDIR/*.c}
+OBJECTS = ${pat-subst $SRCDIR/%.c, $OBJDIR/%.o, $SOURCES}
+
+BIN = $OUTDIR/fabricate
+if ${eq $PLAT, win32} {
+	BIN_SUF = .exe
+}
+BIN += $BIN_SUF
+
+SYSROOT ?= /usr
+SYSBIN ?= $SYSROOT/bin
+SYSINC ?= $SYSROOT/include
+SYSLIB ?= $SYSROOT/lib
+
+CC ?= gcc
+LD ?= $CC
+CC = $WRAPPER $PREFIX$CC
+LD = $WRAPPER $PREFIX$LD
+if ${eq $PLAT, win32} {
+	WINDRES ?= windres
+	WINDRES = $WRAPPER $PREFIX$WINDRES
+}
+
+CFLAGS += -std=c99 -Wall -Wextra -Wuninitialized -Wundef
+CPPFLAGS += ()
+LDFLAGS += ()
+LDLIBS += ()
+if ${not-eq $DEBUG, y} {
+	CPPFLAGS += -DNDEBUG
+	O ?= 2
+} else {
+	CFLAGS += -g -fno-omit-frame-pointer -Wdouble-promotion
+	O ?= g
+	if ${eq $ASAN, y} {
+		CFLAGS += -fsanitize=address
+		LDFLAGS += -fsanitize=address
+	}
+}
+CFLAGS += -O$O
+
+define c-incs {
+	pat-rule $3/$1.c.deps, extern $2/$1.c, create+raw $3 {
+		try {
+			inc = ${join ${split-make ${after :, ${exec $CC -E -MM $CFLAGS $CPPFLAGS $1}}}, "\0"}
+			write ${open-file $0, wb}, $inc
+		}
+	}
+	return extern+eval 'try {split ${open-file $1, rb}, "\0"}' $3/$1.c.deps
+}
+
+phony-rule build, require $BIN
+
+rule $OUTDIR $OBJDIR {mkdir $0}
+
+pat-rule $OBJDIR/%.o, extern $SRCDIR/%.c, ${call c-incs, %, $SRCDIR, $OBJDIR}, create+raw $OBJDIR {
+	msg "Compiling $1..."
+	exec $CC -c $CFLAGS $CPPFLAGS -o $0 $1
+	msg "Compiled $1"
+}
+
+rule $BIN, require $OBJECTS, create $OUTDIR {
+	msg "Linking $0..."
+	exec $LD $LDFLAGS -o $0 $1 $LDLIBS
+	msg "Linked $0"
+	if-not ${eq $PLAT, win32 || exists $OUTDIR/fab$BIN_SUF} {
+		exec at $OUTDIR, ln -s -- fabricate$BIN_SUF fab$BIN_SUF
+	}
+}
+
+phony-rule clean {rmdir $OBJDIR}
+phony-rule distclean, phony+async clean {rm $BIN}
