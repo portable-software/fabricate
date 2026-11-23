@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stddef.h>
 
+#include "string.h"
+
 extern const char* argv0;
 
 typedef const char* FabErr;
