@@ -33,7 +33,7 @@ typedef size_t VMLblID;
 #define VMLBL_INVAL ((VMLblID)-1)
 
 typedef uint32_t VMScopeFlags;
-enum { // TODO: Reorder for cache reasons
+enum { // TODO: Clean up?
 	VMSCOPE_PROG     = 1U << 0,  // Push new program (also implies PC)
 	VMSCOPE_PC       = 1U << 1,  // Push new program counter
 	VMSCOPE_FRAME    = 1U << 2,  // Start a new frame
@@ -71,7 +71,7 @@ enum {
 };
 typedef bool (*VMCall)(VM*, VMCallFlags, size_t argc, VMObjID* argv, void* ctx, VMObjID* ret, int* isRetTruthy, CharBuf* err);
 
-typedef enum {
+typedef enum { // TODO: Reorder for cache reasons
 	VMOP_EXIT,    // Exit VM
 	VMOP_SCOPE,   // Push a new scope
 	VMOP_END,     // Pop the current scope
@@ -87,18 +87,18 @@ typedef enum {
 	VMOP_ARGS,    // Push all arguments as an array
 	VMOP_ARR,     // Create an array from elements in the current frame
 	VMOP_EXPAND,  // Expand an array
-	VMOP_INDEX,   // Index the current object
+	VMOP_INDEX,   // Use the top stack elem (must be str) to index the elem under it
 	VMOP_LEN,     // Get the length of the current object
 	VMOP_SETVAR,  // Set a variable
-	VMOP_SETELEM, // Set an array element in a variable
+	VMOP_SETELEM, // Set an array element in a variable and use the top stack elem
 	VMOP_CALL,    // Call an external function
 	VMOP_RAISE,   // Raise an exception
 	VMOP_SETSRC,  // Set source code info
 } VMOpCode;
 typedef struct {
 	uint_fast16_t code : 8;
-	uint_fast16_t arrCat : 1;   // For CAT
-	uint_fast16_t append : 1;   // For SETVAR and SETELEM
+	uint_fast16_t arrCat : 1; // For CAT
+	uint_fast16_t append : 1; // For SETVAR and SETELEM
 	union {
 		struct {
 			VMScopeFlags flags;
@@ -181,12 +181,32 @@ typedef enum {
 	VMOBJSTRSTOR_XFER,   // Transfer ownership of string
 	VMOBJSTRSTOR_DUP     // String will not always be available, dup immediately
 } VMObjStrStorType;
+typedef uint_fast8_t VMCatObjFlags;
+enum {
+	VMCATOBJ_ARRCAT = (1U << 0), // Do array concat
+	VMCATOBJ_XFER   = (1U << 1)  // Transfer ownership of src object
+};
+typedef uint_fast8_t VMViewObjFlags;
+enum {
+	VMVIEWOBJ_CSTR = (1U << 0), // Ensure data.str.text.data is null-terminated
+};
 
 typedef struct {
 	VMObjID objId;
 	char* name;
 	uint32_t nameCrc;
 } VMVar;
+typedef struct VMLIST(VMVar, var) VMVarList;
+typedef uint_fast8_t VMSetVarFlags;
+enum {
+	VMSETVAR_LOCAL = (1U << 0), // If creating, create as local
+	VMSETVAR_XFER  = (1U << 1)  // Transfer ownership of object
+};
+
+typedef uint_fast8_t VMPushFlags;
+enum {
+	VMPUSH_XFER = (1U << 0), // Transfer ownership of object
+};
 
 typedef struct {
 	VMScopeFlags flags : 30;
@@ -196,11 +216,11 @@ typedef struct {
 	size_t pc;
 	size_t frame;
 	VMObjID out;
-	struct VMLIST(VMVar, var) localVars;
+	VMVarList localVars;
 	size_t argc;
 	size_t argv;
-	VMLblID excLblId;                    // Label of exception handler (VMLBL_INVAL for none)
-	VMLblID resumeLabelId;               // Jump on pop (VMLBL_INVAL for none)
+	VMLblID excLblId;                  // Label of exception handler (VMLBL_INVAL for none)
+	VMLblID resumeLabelId;             // Jump on pop (VMLBL_INVAL for none)
 	size_t srcId;
 } VMScope;
 
@@ -208,10 +228,12 @@ struct VM {
 	struct VLB(VMScope) scopes;
 	struct VLB(VMObjID) stack;
 	struct VMLIST(VMObj, obj) objs;
-	struct VMLIST(VMVar, var) vars;
-	const VM* fallback;                      // Read vars and funcs from here if not found in the current VM
+	VMVarList vars;
+	const VM* fallback;             // Read vars and funcs from here if not found in the current VM
 	void* ctx;
 };
+
+// XXX: For funcs that operate on a VM, if a failure code is returned, the VM is left in undefined state and the only valid call is DelVM
 
 VM* NewVM(VM* fallback, void* ctx, const VMProg*);
 void DelVM(VM*);
@@ -226,21 +248,21 @@ bool VMPopScope(VM*);
 VMObjID VMNewObj(VM*, VMObjType, ...);
 #define VMDelObj VMDecObjRef
 void VMIncObjRef(VM*, VMObjID);
-void VMDecObjRef(VM*, VMObjID);
-bool VMCatObj(VM*, bool arrCat, VMObjID dest, VMObjID src);
-bool VMCatStrToObj(VM*, bool arrCat, VMObjID, VMObjStrStorType, const char* str, size_t len);
+bool VMDecObjRef(VM*, VMObjID);
+bool VMCatObj(VM*, VMCatObjFlags, VMObjID dest, VMObjID src);
+bool VMCatStrToObj(VM*, VMCatObjFlags, VMObjID, VMObjStrStorType, const char* str, size_t len);
+#define VMCatStrLitToObj(V, F, I, S, L) VMCatStrToObj((V), (F), (I), VMOBJSTRSTOR_STATIC, ("" S), sizeof(S) - 1)
 VMObjID VMDupObj(VM*, VMObjID);
-void VMViewObj(VM*, VMObjID, VMObj*);
-VMObjType VMGetRealObjType(VM*, VMObjID);
+bool VMViewObj(VM*, VMViewObjFlags, VMObjID, VMObj*);
+VMObjType VMGetRealObjType(const VM*, VMObjID);
 bool VMIsObjTruthy(VM*, VMObjID);
 bool VMCollapseObj(VM*, VMObjID);
 
-bool VMNewVar(VM*, const char* name, uint32_t nameCrc, bool local);
-void VMDelVar(VM*, const char* name, uint32_t nameCrc);
+bool VMSetVar(VM*, VMSetVarFlags, const char* name, uint32_t nameCrc, VMObjID);
+bool VMDelVar(VM*, const char* name, uint32_t nameCrc);
 VMObjID VMGetVar(const VM*, const char* name, uint32_t nameCrc);
-bool VMSetVar(VM*, const char* name, uint32_t nameCrc, VMObjID);
 
-bool VMPush(VM*, VMObjID, bool copy);
+bool VMPush(VM*, VMPushFlags, VMObjID);
 VMObjID VMPop(VM*);
 
 void VMRaise(VM*);

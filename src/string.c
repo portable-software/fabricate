@@ -6,9 +6,8 @@
 char* DupStr(const char* str) {
 	size_t len = strlen(str) + 1;
 	char* buf = malloc(len);
-	if (!buf) return NULL;
-	memcpy(buf, str, len);
-	return buf;
+	if (buf) return memcpy(buf, str, len);
+	return NULL;
 }
 
 bool MatchWildcard(const char* pat, const char* text) {

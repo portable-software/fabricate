@@ -2,12 +2,23 @@
 
 #include <stdarg.h>
 
+typedef struct {
+	uint_fast8_t isRange : 1;
+	uint_fast8_t hasStart : 1;
+	uint_fast8_t hasEnd : 1;
+	uint_fast8_t isStartNeg : 1;
+	uint_fast8_t isEndNeg : 1;
+	size_t start;
+	size_t end;
+} IdxOut;
+
 static inline void FreeObj(VMObj*);
 static inline void InitCoWObj(VM*, VMObjID, VMObjID target, size_t start, size_t end);
-static inline void UnCoWObj(VM*, VMObj*);
+static inline bool UnCoWObj(VM*, VMObj*);
 static inline void UnlinkCoWObj(VM*, VMObj*);
-static inline void InvalCoWObjRefs(VM*, VMObj*);
-static inline void InvalCoWRangeObjRefs(VM*, VMObj*, size_t start, size_t end);
+static inline bool InvalObjCoWRefs(VM*, VMObj*);
+static inline bool InvalObjCoWRefsWRange(VM*, VMObj*, size_t start, size_t end);
+static inline bool ParseIdx(const char*, IdxOut*);
 
 bool ExecVM(VM* vm, CharBuf* err) {
 	while (1) {
@@ -19,18 +30,19 @@ bool ExecVM(VM* vm, CharBuf* err) {
 		size_t size;
 		switch ((VMOpCode)op->code) {
 			case VMOP_EXIT: {
-				--scope->pc;
 				return true;
-			} break;
+			}
 			case VMOP_SCOPE: {
-				if (!VMPushScope(
+				if (VMPushScope(
 					vm, op->opnds.scope.flags,
 					(op->opnds.scope.params != (size_t)-1) ? &prog->scopeParams[op->opnds.scope.params] : NULL
-				)) goto fatal;
-			} break;
+				)) break;
+				goto fatal;
+			}
 			case VMOP_END: {
-				if (!VMPopScope(vm)) goto fatal;
-			} break;
+				if (VMPopScope(vm)) break;
+				goto fatal;
+			}
 			case VMOP_JMP: {
 				scope->pc = prog->lblTbl[op->opnds.jmp.labelId];
 			} break;
@@ -41,32 +53,30 @@ bool ExecVM(VM* vm, CharBuf* err) {
 				if (!scope->isLastOutTruthy) scope->pc = prog->lblTbl[op->opnds.jz.labelId];
 			} break;
 			case VMOP_CAT: {
-				VMObjID objId = vm->stack.data[vm->stack.len - 1];
-				if (!VMCatObj(
-					vm, op->arrCat,
-					vm->stack.data[vm->stack.len - 2],
-					objId
-				)) goto fatal;
-				VMDelObj(vm, objId);
-				--vm->stack.len;
-			} break;
+				VMObjID objId = vm->stack.data[--vm->stack.len];
+				if (VMCatObj(
+					vm, ((op->arrCat) ? VMCATOBJ_ARRCAT : 0) | VMCATOBJ_XFER,
+					vm->stack.data[vm->stack.len - 2], objId
+				)) break;
+				goto fatal;
+			}
 			case VMOP_PUSH: {
 				push_null:
 				objId = VMNewObj(vm, VMOBJ_NULL);
 				push:
 				if (objId == VMOBJ_INVAL) goto fatal;
 				push_noCheck:
-				VLB_ADD(vm->stack, objId, 2, 1, VMDelObj(vm, objId); goto fatal;);
+				VLB_ADD(vm->stack, objId, 2, 1, goto fatal;);
 			} break;
 			case VMOP_STR: {
 				objId = VMNewObj(vm, VMOBJ_STR, VMOBJSTRSTOR_DUP, prog->strTbl + op->opnds.str.dataOff, op->opnds.str.dataLen);
 				goto push;
-			} break;
+			}
 			case VMOP_VAR: {
 				objId = VMGetVar(vm, prog->strTbl + op->opnds.var.nameOff, op->opnds.var.nameCrc);
 				if (objId != VMOBJ_INVAL) goto push_noCheck;
 				goto push_null;
-			} break;
+			}
 			case VMOP_ARGC: {
 				size = scope->argc;
 				push_sz:
@@ -74,7 +84,7 @@ bool ExecVM(VM* vm, CharBuf* err) {
 				if (len < 0) goto fatal;
 				objId = VMNewObj(vm, VMOBJ_STR, VMOBJSTRSTOR_DUP, szStr, (size_t)len);
 				goto push;
-			} break;
+			}
 			case VMOP_ARGV: {
 				size_t i = op->opnds.argv.index;
 				if (i < scope->argc) {
@@ -82,7 +92,7 @@ bool ExecVM(VM* vm, CharBuf* err) {
 					goto push_noCheck;
 				}
 				goto push_null;
-			} break;
+			}
 			case VMOP_ARGS: {
 				size_t argc = scope->argc;
 				size_t argv = scope->argv;
@@ -90,13 +100,10 @@ bool ExecVM(VM* vm, CharBuf* err) {
 				if (objId == VMOBJ_INVAL) goto fatal;
 				VMObj* arr = &vm->objs.data[objId].obj;
 				for (size_t i = 0; i < argc; ++i) {
-					if (!VMCatObj(vm, false, arr->data.arr.elems.data[i], vm->stack.data[argv + i])) {
-						VMDelObj(vm, objId);
-						goto fatal;
-					}
+					if (!VMCatObj(vm, 0, arr->data.arr.elems.data[i], vm->stack.data[argv + i])) goto fatal;
 				}
 				goto push_noCheck;
-			} break;
+			}
 			case VMOP_ARR: {
 				size_t frame = scope->frame;
 				size_t frameLen = vm->stack.len - frame;
@@ -109,16 +116,14 @@ bool ExecVM(VM* vm, CharBuf* err) {
 				scope->flags &= ~VMSCOPE_FRAME;
 				vm->stack.len = frame;
 				if (VMPopScope(vm)) goto push_noCheck;
-				VMDelObj(vm, objId);
 				goto fatal;
-			} break;
+			}
 			case VMOP_EXPAND: {
 				size_t stackTop = vm->stack.len - 1;
 				objId = vm->stack.data[stackTop];
-				VMObjType type = VMGetRealObjType(vm, objId);
-				if (type != VMOBJ_ARR) break;
 				VMObj arr;
-				VMViewObj(vm, objId, &arr);
+				VMViewObj(vm, 0, objId, &arr);
+				if (arr.type != VMOBJ_ARR) break;
 				if (!arr.data.arr.elems.len) break;
 				VLB_EXPANDBY(vm->stack, arr.data.arr.elems.len - 1, 2, 1, goto fatal;);
 				for (size_t i = 0; i < arr.data.arr.elems.len; ++i) {
@@ -126,8 +131,9 @@ bool ExecVM(VM* vm, CharBuf* err) {
 					++vm->objs.data[obj].obj.refCount;
 					vm->stack.data[stackTop + i] = obj;
 				}
-				VMDelObj(vm, objId);
-			} break;
+				if (VMDelObj(vm, objId)) break;
+				goto fatal;
+			}
 			case VMOP_INDEX: {
 				// TODO
 				// REM: (size_t)-1 is out of range
@@ -144,25 +150,23 @@ bool ExecVM(VM* vm, CharBuf* err) {
 						size = obj->data.str.text.len;
 						break;
 					default:
-						VMDelObj(vm, objId);
-						goto push_null;
+						if (VMDelObj(vm, objId)) goto push_null;
+						goto fatal;
 				}
-				VMDelObj(vm, objId);
-				goto push_sz;
-			} break;
+				if (VMDelObj(vm, objId)) goto push_sz;
+				goto fatal;
+			}
 			case VMOP_SETVAR: {
-				objId = vm->stack.data[vm->stack.len - 1];
+				objId = vm->stack.data[--vm->stack.len];
 				if (!op->append) {
 					setVar_set:
-					if (VMSetVar(vm, prog->strTbl + op->opnds.setVar.nameOff, op->opnds.setVar.nameCrc, objId)) goto fatal;
-					scope->isLastOutTruthy = VMIsObjTruthy(vm, objId);
+					if (!VMSetVar(vm, VMSETVAR_XFER, prog->strTbl + op->opnds.setVar.nameOff, op->opnds.setVar.nameCrc, objId)) goto fatal;
 				} else {
 					VMObjID varObjId = VMGetVar(vm, prog->strTbl + op->opnds.setVar.nameOff, op->opnds.setVar.nameCrc);
 					if (varObjId == VMOBJ_INVAL) goto setVar_set;
-					if (!VMCatObj(vm, false, varObjId, objId)) goto fatal;
+					if (!VMCatObj(vm, VMCATOBJ_XFER, varObjId, objId)) goto fatal;
 				}
-				VMDelObj(vm, objId);
-				--vm->stack.len;
+				scope->isLastOutTruthy = VMIsObjTruthy(vm, objId);
 			} break;
 			case VMOP_SETELEM: {
 				// TODO
@@ -184,7 +188,7 @@ bool ExecVM(VM* vm, CharBuf* err) {
 				if (isRetTruthy == -1) isRetTruthy = VMIsObjTruthy(vm, ret);
 				scope->isLastOutTruthy = isRetTruthy;
 				if (scope->out != VMOBJ_INVAL) {
-					if (!VMCatObj(vm, scope->wroteToOut, scope->out, ret)) goto fatal;
+					if (!VMCatObj(vm, (scope->wroteToOut) ? VMCATOBJ_ARRCAT : 0, scope->out, ret)) goto fatal;
 					scope->wroteToOut = 1;
 				}
 				if (!VMPopScope(vm)) goto fatal;
@@ -205,6 +209,10 @@ bool ExecVM(VM* vm, CharBuf* err) {
 	error:
 	// TODO: Prepend source info to err
 	return false;
+}
+
+static inline bool ParseIdx(const char*, IdxOut*) {
+	// TODO
 }
 
 VM* NewVM(VM* fallback, void* ctx, const VMProg* prog) {
@@ -314,14 +322,14 @@ bool VMPopScope(VM* vm) {
 		for (size_t i = 0; i < tmp; ++i) {
 			VMVar* var = &scope->localVars.data[i].var;
 			if (!var->name) continue;
-			VMDelObj(vm, var->objId);
+			if (!VMDelObj(vm, var->objId)) return false;
 			free(var->name);
 		}
 	}
 	if (flags & VMSCOPE_FRAME) {
 		tmp = vm->stack.len;
 		for (size_t i = scope->frame; i < tmp; ++i) {
-			VMDelObj(vm, vm->stack.data[i]);
+			if (!VMDelObj(vm, vm->stack.data[i])) return false;
 		}
 		vm->stack.len = scope->frame;
 	}
@@ -329,12 +337,13 @@ bool VMPopScope(VM* vm) {
 		VMObjID outObjId = scope->out;
 		if (scope->flags & VMSCOPE_COLLAPSE) {
 			VMObjID collObjId = VMCollapseObj(vm, outObjId);
-			if (collObjId == VMOBJ_INVAL) return false;
-			VMDelObj(vm, outObjId);
+			if (collObjId == VMOBJ_INVAL || !VMDelObj(vm, outObjId)) return false;
 			outObjId = collObjId;
 		}
-		if (!VMCatObj(vm, !!(scope->flags & VMSCOPE_ARRCAT), vm->stack.data[vm->stack.len - 1], outObjId)) return false;
-		VMDelObj(vm, outObjId);
+		if (!VMCatObj(
+			vm, ((scope->flags & VMSCOPE_ARRCAT) ? VMCATOBJ_ARRCAT : 0) | VMCATOBJ_XFER,
+			vm->stack.data[vm->stack.len - 1], outObjId
+		)) return false;
 	}
 	if (flags & VMSCOPE_RESUME) {
 		prevScope->pc = prevScope->prog->lblTbl[scope->resumeLabelId];
@@ -343,6 +352,83 @@ bool VMPopScope(VM* vm) {
 	--vm->scopes.len;
 
 	return true;
+}
+
+static inline size_t FindVar(const VMVarList* varList, const char* name, uint32_t nameCrc) {
+	register size_t len = varList->len;
+	for (size_t i = 0; i < len; ++i) {
+		VMVar* var = &varList->data[i].var;
+		if (!var->name) continue;
+		if (var->nameCrc == nameCrc && !strcmp(var->name, name)) return i;
+	}
+	return -1;
+}
+static inline size_t FindVarAndList(VM* vm, const char* name, uint32_t nameCrc, VMVarList** varListOut) {
+	VMVarList* varList = &vm->scopes.data[vm->scopes.len - 1].localVars;
+	size_t varId = FindVar(varList, name, nameCrc);
+	if (varId == (size_t)-1) {
+		varList = &vm->vars;
+		varId = FindVar(varList, name, nameCrc);
+		if (varId == (size_t)-1) return -1;
+	}
+	*varListOut = varList;
+	return varId;
+}
+static inline size_t FindVarAndList_Const(const VM* vm, const char* name, uint32_t nameCrc, const VMVarList** varListOut) {
+	const VMVarList* varList = &vm->scopes.data[vm->scopes.len - 1].localVars;
+	size_t varId = FindVar(varList, name, nameCrc);
+	if (varId == (size_t)-1) {
+		varList = &vm->vars;
+		varId = FindVar(varList, name, nameCrc);
+		if (varId == (size_t)-1) return -1;
+	}
+	*varListOut = varList;
+	return varId;
+}
+bool VMSetVar(VM* vm, VMSetVarFlags flags, const char* name, uint32_t nameCrc, VMObjID objId) {
+	VMVarList* varList;
+	size_t varId = FindVarAndList(vm, name, nameCrc, &varList);
+	VMVar* var;
+	if (varId != (size_t)-1) {
+		var = &varList->data[varId].var;
+		if (!VMDelObj(vm, var->objId)) return false;
+		finish:
+		var->objId = objId;
+		if (!(flags & VMSETVAR_XFER)) VMIncObjRef(vm, objId);
+		return true;
+	}
+	varList = (!(flags & VMSETVAR_LOCAL)) ? &vm->vars : &vm->scopes.data[vm->scopes.len - 1].localVars;
+	if (varList->firstFree != (size_t)-1) {
+		varId = varList->firstFree;
+		var = &varList->data[varId].var;
+		varList->firstFree = varList->data[varId].nextFree;
+	} else {
+		varId = varList->len;
+		VMLIST_NEXTPTR(*varList, var, var, 2, 1, return false;);
+	}
+	char* dupName = DupStr(name);
+	if (!dupName) return false;
+	var->name = dupName;
+	var->nameCrc = nameCrc;
+	goto finish;
+}
+bool VMDelVar(VM* vm, const char* name, uint32_t nameCrc) {
+	VMVarList* varList;
+	size_t varId = FindVarAndList(vm, name, nameCrc, &varList);
+	if (varId == (size_t)-1) return true;
+	VMVar* var = &varList->data[varId].var;
+	if (!VMDelObj(vm, var->objId)) return false;
+	free(var->name);
+	var->name = NULL;
+	varList->data[varId].nextFree = varList->firstFree;
+	varList->firstFree = varId;
+	return true;
+}
+VMObjID VMGetVar(const VM* vm, const char* name, uint32_t nameCrc) {
+	const VMVarList* varList;
+	size_t varId = FindVarAndList_Const(vm, name, nameCrc, &varList);
+	if (varId == (size_t)-1) return VMOBJ_INVAL;
+	return varList->data[varId].var.objId;
 }
 
 VMObjID VMNewObj(VM* vm, VMObjType type, ...) {
@@ -354,7 +440,7 @@ VMObjID VMNewObj(VM* vm, VMObjType type, ...) {
 		vm->objs.firstFree = vm->objs.data[objId].nextFree;
 	} else {
 		objId = vm->objs.len;
-		VMLIST_NEXTPTR(vm->objs, obj, obj, 2, 1, goto fatal;);
+		VMLIST_NEXTPTR(vm->objs, obj, obj, 2, 1, return VMOBJ_INVAL;);
 	}
 	va_list va;
 	obj->type = type;
@@ -385,7 +471,7 @@ VMObjID VMNewObj(VM* vm, VMObjType type, ...) {
 					} break;
 					case VMOBJSTRSTOR_DUP: {
 						VLB_ZINIT(obj->data.str.text);
-						VLB_EXPANDTO(obj->data.str.text, len, 2, 1, goto fatal2;);
+						VLB_EXPANDTO(obj->data.str.text, len, 2, 1, return VMOBJ_INVAL;);
 						memcpy(obj->data.str.text.data, str, len);
 						obj->data.str.ro = 0;
 					} break;
@@ -399,23 +485,17 @@ VMObjID VMNewObj(VM* vm, VMObjType type, ...) {
 			VLB_ZINIT(obj->data.arr.elems);
 			size_t len = va_arg(va, size_t);
 			if (!len) break;
-			VLB_EXPANDTO(obj->data.arr.elems, len, 2, 1, goto fatal2;);
+			VLB_EXPANDTO(obj->data.arr.elems, len, 2, 1, return VMOBJ_INVAL;);
 			unsigned init = va_arg(va, unsigned);
 			if (!init) break;
 			size_t i;
 			VMObjID elem;
 			for (i = 0; i < len; ++i) {
 				elem = VMNewObj(vm, VMOBJ_NULL);
-				if (elem == VMOBJ_INVAL) goto arr_fatal;
+				if (elem == VMOBJ_INVAL) return VMOBJ_INVAL;
 				obj->data.arr.elems.data[i] = elem;
 			}
 			break;
-			arr_fatal:
-			VMDelObj(vm, elem);
-			for (size_t j = 0; j < i; ++j) {
-				VMDelObj(vm, obj->data.arr.elems.data[j]);
-			}
-			goto fatal2;
 		} break;
 		case VMOBJ_STREAM: {
 			obj->data.stream = va_arg(va, IOStream*);
@@ -426,13 +506,6 @@ VMObjID VMNewObj(VM* vm, VMObjType type, ...) {
 	}
 	va_end(va);
 	return objId;
-
-	fatal2:
-	obj->refCount = 0;
-	vm->objs.data[objId].nextFree = vm->objs.firstFree;
-	vm->objs.firstFree = objId;
-	fatal:
-	return VMOBJ_INVAL;
 }
 static inline void FreeObj(VMObj* obj) {
 	switch (obj->type) {
@@ -450,15 +523,18 @@ static inline void FreeObj(VMObj* obj) {
 			break;
 	}
 }
-static inline void DelObj(VM* vm, VMObjID objId) {
-	FreeObj(&vm->objs.data[objId].obj);
+static inline bool UnlinkObj(VM* vm, VMObjID objId) {
+	VMObj* obj = &vm->objs.data[objId].obj;
+	if (!InvalObjCoWRefs(vm, obj)) return false;
+	FreeObj(obj);
 	vm->objs.data[objId].nextFree = vm->objs.firstFree;
 	vm->objs.firstFree = objId;
+	return true;
 }
 void VMIncObjRef(VM* vm, VMObjID objId) {
 	++vm->objs.data[objId].obj.refCount;
 }
-void VMDecObjRef(VM* vm, VMObjID objId) {
+bool VMDecObjRef(VM* vm, VMObjID objId) {
 	VMObj* obj = &vm->objs.data[objId].obj;
 	if (!--obj->refCount) {
 		switch (obj->type) {
@@ -471,7 +547,7 @@ void VMDecObjRef(VM* vm, VMObjID objId) {
 					VMObjID elemId = obj->data.arr.elems.data[i];
 					VMObj* elem = &vm->objs.data[elemId].obj;
 					if (elem->type != VMOBJ_ARR) {
-						VMDelObj(vm, elemId);
+						if (!VMDelObj(vm, elemId)) return false;
 					} else if (!--elem->refCount) {
 						elem->data.arr.freeRet = objId;
 						elem->data.arr.freeRetIndex = i;
@@ -485,28 +561,38 @@ void VMDecObjRef(VM* vm, VMObjID objId) {
 				resume = obj->data.arr.freeRetIndex;
 				obj = &vm->objs.data[objId].obj;
 				goto again;
-			} break;
+			}
 			case VMOBJ_COW:
 				UnlinkCoWObj(vm, obj);
-				break;
+				return false;
 			case VMOBJ_NULL:
 			case VMOBJ_STR:
 			case VMOBJ_STREAM:
 				break;
 		}
-		DelObj(vm, objId);
+		if (!UnlinkObj(vm, objId)) return false;
 	}
+	return true;
 }
 
-// TODO: VMCatObj, VMCatStrToObj
 // REM: Do not CoW empty string or array
+bool VMCatObj(VM*, VMCatObjFlags, VMObjID dest, VMObjID src) {
+	// TODO
+}
+bool VMCatStrToObj(VM*, VMCatObjFlags, VMObjID, VMObjStrStorType, const char* str, size_t len) {
+	// TODO
+}
 
-void VMViewObj(VM* vm, VMObjID objId, VMObj* out) {
+bool VMViewObj(VM* vm, VMViewObjFlags flags, VMObjID origObjId, VMObj* out) {
+	VMObjID objId = origObjId;
 	VMObj* obj = &vm->objs.data[objId].obj;
 	size_t off = 0, len = (size_t)-1;
 	again:
 	switch (obj->type) {
+		case VMOBJ_NULL:
+			break;
 		case VMOBJ_STR:
+			if (flags & VMVIEWOBJ_CSTR) goto cstr;
 			if (len > obj->data.str.text.len) len = obj->data.str.text.len;
 			out->data.str.text.data = obj->data.str.text.data + off;
 			out->data.str.text.len = len;
@@ -528,13 +614,24 @@ void VMViewObj(VM* vm, VMObjID objId, VMObj* out) {
 				if (obj->type != VMOBJ_COW) break;
 			}
 			goto again;
-		case VMOBJ_NULL:
-			break;
 	}
 	out->type = obj->type;
+	return true;
+
+	cstr:
+	if (objId == origObjId) {
+		cstr_term:
+		if (!CBNullTerm(&obj->data.str.text)) return false;
+		out->data.str.text.data = obj->data.str.text.data;
+		out->data.str.text.len = obj->data.str.text.len;
+		return true;
+	}
+	obj = &vm->objs.data[origObjId].obj;
+	if (UnCoWObj(vm, obj)) goto cstr_term;
+	return false;
 }
 
-VMObjType VMGetRealObjType(VM* vm, VMObjID objId) {
+VMObjType VMGetRealObjType(const VM* vm, VMObjID objId) {
 	while (1) {
 		VMObj* obj = &vm->objs.data[objId].obj;
 		if (obj->type != VMOBJ_COW) return obj->type;
@@ -543,7 +640,7 @@ VMObjType VMGetRealObjType(VM* vm, VMObjID objId) {
 }
 bool VMIsObjTruthy(VM* vm, VMObjID objId) {
 	VMObj obj;
-	VMViewObj(vm, objId, &obj);
+	VMViewObj(vm, 0, objId, &obj);
 	switch (obj.type) {
 		default:           return false;
 		case VMOBJ_STR:    return !!obj.data.str.text.len;
@@ -554,6 +651,8 @@ bool VMIsObjTruthy(VM* vm, VMObjID objId) {
 bool VMCollapseObj(VM* vm, VMObjID objId) {
 	VMObjType type = VMGetRealObjType(vm, objId);
 	if (type != VMOBJ_ARR) return true;
+
+	// TODO
 
 	return false;
 }
@@ -571,8 +670,9 @@ static inline void InitCoWObj(VM* vm, VMObjID objId, VMObjID tgtObjId, size_t st
 	if (nextObjId == VMOBJ_INVAL) return;
 	vm->objs.data[nextObjId].obj.data.cow.prevCowId = objId;
 }
-static inline void UnCoWObj(VM*, VMObj*) {
-	
+static inline bool CoWObjToObj(VM*, VMObj*) {
+	// TODO
+	return false;
 }
 static inline void UnlinkCoWObj(VM* vm, VMObj* obj) {
 	VMObjID nextCowId = obj->data.cow.nextCowId;
@@ -586,24 +686,32 @@ static inline void UnlinkCoWObj(VM* vm, VMObj* obj) {
 		vm->objs.data[nextCowId].obj.data.cow.prevCowId = prevCowId;
 	}
 }
-static inline void InvalCoWObjRefs(VM* vm, VMObj* obj) {
+static inline bool UnCoWObj(VM* vm, VMObj* obj) {
+	UnlinkCoWObj(vm, obj);
+	return CoWObjToObj(vm, obj);
+}
+static inline bool InvalObjCoWRefs(VM* vm, VMObj* obj) {
 	VMObjID cowObjId = obj->firstCowId;
 	obj->firstCowId = VMOBJ_INVAL;
 	while (1) {
-		if (cowObjId == VMOBJ_INVAL) break;
+		if (cowObjId == VMOBJ_INVAL) return true;
 		VMObj* cowObj = &vm->objs.data[cowObjId].obj;
 		cowObjId = cowObj->data.cow.nextCowId;
-		UnCoWObj(vm, cowObj);
+		if (!CoWObjToObj(vm, cowObj)) return false;
 	}
 }
-static inline void InvalCoWRangeObjRefs(VM* vm, VMObj* obj, size_t start, size_t end) {
+static inline bool InvalObjCoWRefsWRange(VM* vm, VMObj* obj, size_t start, size_t end) {
 	VMObjID cowObjId = obj->firstCowId;
 	while (1) {
-		if (cowObjId == VMOBJ_INVAL) break;
+		if (cowObjId == VMOBJ_INVAL) return true;
 		VMObj* cowObj = &vm->objs.data[cowObjId].obj;
 		cowObjId = cowObj->data.cow.nextCowId;
 		size_t cowStart = cowObj->data.cow.start;
 		size_t cowEnd = cowObj->data.cow.end;
-		if (end >= cowStart && start <= cowEnd) UnlinkCoWObj(vm, cowObj);
+		if (end >= cowStart && start <= cowEnd && !UnCoWObj(vm, cowObj)) return false;
 	}
+}
+
+void VMRaise(VM*) {
+	// TODO
 }
