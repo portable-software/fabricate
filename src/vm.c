@@ -1,16 +1,7 @@
 #include "vm.h"
 
 #include <stdarg.h>
-
-typedef struct {
-	uint_fast8_t isRange : 1;
-	uint_fast8_t hasStart : 1;
-	uint_fast8_t hasEnd : 1;
-	uint_fast8_t isStartNeg : 1;
-	uint_fast8_t isEndNeg : 1;
-	size_t start;
-	size_t end;
-} IdxOut;
+#include <ctype.h>
 
 static inline void FreeObj(VMObj*);
 static inline void InitCoWObj(VM*, VMObjID, VMObjID target, size_t start, size_t end);
@@ -18,7 +9,109 @@ static inline bool UnCoWObj(VM*, VMObj*);
 static inline void UnlinkCoWObj(VM*, VMObj*);
 static inline bool InvalObjCoWRefs(VM*, VMObj*);
 static inline bool InvalObjCoWRefsWRange(VM*, VMObj*, size_t start, size_t end);
-static inline bool ParseIdx(const char*, IdxOut*);
+
+typedef struct {
+	uint_fast8_t isInval : 1;
+	uint_fast8_t isSub : 1;
+	uint_fast8_t isAdd : 1;
+} IdxNumFlags;
+typedef struct {
+	uint_fast8_t isLen : 1;
+	uint_fast8_t isRange : 1;
+} IdxFlags;
+typedef struct {
+	IdxFlags flags;
+	size_t start;
+	size_t end;
+} IdxOut;
+static inline IdxNumFlags ParseIdx_GetNum(const char** strPtr, size_t* numOut) {
+	IdxNumFlags flags;
+	const char* str = *strPtr;
+	char c = *str;
+	if (c != '+') {
+		if (c != '-') {
+			flags = (IdxNumFlags){0};
+			if (isdigit(c)) {
+				isDig:;
+				size_t num = c - '0';
+				c = *++str;
+				while (isdigit(c)) {
+					size_t newNum = num * 10 + (c - '0');
+					if (newNum > num) {
+						num = newNum;
+						c = *++str;
+					} else {
+						num = -1;
+						do {c = *++str;} while (isdigit(c));
+						break;
+					}
+				}
+				*strPtr = str;
+				*numOut = num;
+			}
+			return flags;
+		} else {
+			flags = (IdxNumFlags){.isSub = 1};
+		}
+	} else {
+		flags = (IdxNumFlags){.isAdd = 1};
+	}
+	c = *++str;
+	if (isdigit(c)) goto isDig;
+	return (IdxNumFlags){.isInval = 1};
+}
+static inline bool ParseIdx(const char* str, size_t max, IdxOut* idxOut) {
+	// TODO
+	char c = *str;
+	while (isspace(c)) {c = *++str;}
+	if (c == '\0') {
+		idxOut->flags = (IdxFlags){.isLen = 1};
+		return true;
+	}
+	idxOut->flags = (IdxFlags){0};
+	size_t start = 0;
+	if (c != '.') {
+		IdxNumFlags numFlags = ParseIdx_GetNum(&str, &start);
+		if (numFlags.isInval || numFlags.isAdd) return false;
+		if (numFlags.isSub) {
+			if (!start) return false;
+			--start;
+			start = (start < max) ? max - start : 0;
+		} else if (start > max) {
+			start = max;
+		}
+		idxOut->start = start;
+		c = *str;
+		while (isspace(c)) {c = *++str;}
+		if (c == '\0') return true;
+		if (max == (size_t)-1) return false;
+		if (c != '.') return false;
+	} else {
+		idxOut->start = 0;
+	}
+	c = *++str;
+	if (c != '.') return false;
+	do {c = *++str;} while (isspace(c));
+	size_t end = -1;
+	IdxNumFlags numFlags = ParseIdx_GetNum(&str, &end);
+	if (numFlags.isInval) return false;
+	idxOut->flags.isRange = 1;
+	if (numFlags.isSub) {
+		if (!end) return false;
+		--end;
+		end = (end < max) ? max - end : 0;
+	} else {
+		if (numFlags.isAdd) {
+			size_t newEnd = end + start;
+			end = (newEnd >= end) ? newEnd : (size_t)-1;
+		}
+		if (end > max) end = max;
+	}
+	idxOut->end = end;
+	c = *str;
+	while (isspace(c)) {c = *++str;}
+	return (c == '\0');
+}
 
 bool ExecVM(VM* vm, CharBuf* err) {
 	while (1) {
@@ -137,8 +230,10 @@ bool ExecVM(VM* vm, CharBuf* err) {
 			case VMOP_INDEX: {
 				// TODO
 				// REM: (size_t)-1 is out of range
+				// REM: if isLen, jump to len
 			} break;
 			case VMOP_LEN: {
+				len:
 				objId = vm->stack.data[--vm->stack.len];
 				VMObj* obj = &vm->objs.data[objId].obj;
 				VMObjType objType = VMGetRealObjType(vm, objId);
@@ -203,16 +298,12 @@ bool ExecVM(VM* vm, CharBuf* err) {
 	}
 
 	fatal:
-	CBAddStr(err, ERR_INT);
+	CBAddStrLit(err, ERR_INT);
 	return false;
 
 	error:
 	// TODO: Prepend source info to err
 	return false;
-}
-
-static inline bool ParseIdx(const char*, IdxOut*) {
-	// TODO
 }
 
 VM* NewVM(VM* fallback, void* ctx, const VMProg* prog) {
@@ -262,9 +353,9 @@ void DelVM(VM* vm) {
 }
 
 bool VMPushScope(VM* vm, VMScopeFlags flags, const VMScopeParams* params) {
-	VMScope* prevScope = &vm->scopes.data[vm->scopes.len - 1];
+	VMScope* prevScope = &vm->scopes.data[--vm->scopes.len];
 	VMScope* scope;
-	VLB_NEXTPTR(vm->scopes, scope, 2, 1, goto fatal;);
+	VLB_NEXTPTR(vm->scopes, scope, 2, 1, return false;);
 
 	if (!(flags & VMSCOPE_RETURN)) flags |= prevScope->flags & VMSCOPE_NORETURN;
 	else flags |= VMSCOPE_SETOUT;
@@ -283,7 +374,7 @@ bool VMPushScope(VM* vm, VMScopeFlags flags, const VMScopeParams* params) {
 			scope->out = VMOBJ_INVAL;
 		} else {
 			VMObjID out = VMNewObj(vm, VMOBJ_NULL);
-			if (out == VMOBJ_INVAL) goto fatal2;
+			if (out == VMOBJ_INVAL) return false;
 			scope->out = out;
 		}
 	}
@@ -300,18 +391,15 @@ bool VMPushScope(VM* vm, VMScopeFlags flags, const VMScopeParams* params) {
 		scope->argc = vm->stack.len - prevScope->frame;
 		scope->argv = prevScope->frame;
 	}
-	scope->excLblId = (!(flags & VMSCOPE_EXC)) ? prevScope->excLblId : params->excLblId;
+	scope->excLblId = (!(flags & VMSCOPE_EXC)) ? VMLBL_INVAL : params->excLblId;
 	scope->resumeLabelId = (!(flags & VMSCOPE_RESUME)) ? VMLBL_INVAL : params->resumeLabelId;
 	scope->srcId = prevScope->srcId;
 
-	fatal2:
-	--vm->scopes.len;
-	fatal:
-	return NULL;
+	return true;
 }
 bool VMPopScope(VM* vm) {
-	VMScope* prevScope = &vm->scopes.data[vm->scopes.len - 2];
-	VMScope* scope = &vm->scopes.data[vm->scopes.len - 1];
+	VMScope* scope = &vm->scopes.data[--vm->scopes.len];
+	VMScope* prevScope = &vm->scopes.data[vm->scopes.len - 1];
 	VMScopeFlags flags = scope->flags;
 
 	size_t tmp;
@@ -348,8 +436,6 @@ bool VMPopScope(VM* vm) {
 	if (flags & VMSCOPE_RESUME) {
 		prevScope->pc = prevScope->prog->lblTbl[scope->resumeLabelId];
 	}
-
-	--vm->scopes.len;
 
 	return true;
 }
@@ -495,13 +581,15 @@ VMObjID VMNewObj(VM* vm, VMObjType type, ...) {
 				if (elem == VMOBJ_INVAL) return VMOBJ_INVAL;
 				obj->data.arr.elems.data[i] = elem;
 			}
-			break;
 		} break;
 		case VMOBJ_STREAM: {
 			obj->data.stream = va_arg(va, IOStream*);
 		} break;
 		case VMOBJ_COW: {
-			InitCoWObj(vm, objId, va_arg(va, VMObjID), va_arg(va, size_t), va_arg(va, size_t));
+			VMObjID tgtObjId = va_arg(va, VMObjID);
+			size_t start = va_arg(va, size_t);
+			size_t end = va_arg(va, size_t);
+			InitCoWObj(vm, objId, tgtObjId, start, end);
 		} break;
 	}
 	va_end(va);
@@ -578,9 +666,11 @@ bool VMDecObjRef(VM* vm, VMObjID objId) {
 // REM: Do not CoW empty string or array
 bool VMCatObj(VM*, VMCatObjFlags, VMObjID dest, VMObjID src) {
 	// TODO
+	return false;
 }
 bool VMCatStrToObj(VM*, VMCatObjFlags, VMObjID, VMObjStrStorType, const char* str, size_t len) {
 	// TODO
+	return false;
 }
 
 bool VMViewObj(VM* vm, VMViewObjFlags flags, VMObjID origObjId, VMObj* out) {
@@ -672,6 +762,7 @@ static inline void InitCoWObj(VM* vm, VMObjID objId, VMObjID tgtObjId, size_t st
 }
 static inline bool CoWObjToObj(VM*, VMObj*) {
 	// TODO
+	// REM: When unCoWing an array, CoW all elems
 	return false;
 }
 static inline void UnlinkCoWObj(VM* vm, VMObj* obj) {

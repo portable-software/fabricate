@@ -17,6 +17,7 @@ static inline bool CBAddPartStr(CharBuf* b, const char* s, size_t l) {
 static inline bool CBAddStr(CharBuf* b, const char* s) {
     return CBAddPartStr(b, s, strlen(s));
 }
+#define CBAddStrLit(B, S) CBAddPartStr((B), ("" S), sizeof(S) - 1)
 static inline bool CBNullTerm(CharBuf* b) {
 	VLB__EXP(*b, 2, 1, b->data[b->len] = '\0', return false;);
 	return true;
